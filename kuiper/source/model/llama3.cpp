@@ -115,6 +115,10 @@ base::Status LLama2Model::init(base::DeviceType device_type) {
 
   device_type_ = device_type;
   if (device_type == DeviceType::kDeviceCUDA) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+      return error::InternalError("No CUDA devices found or Driver incompatible.");
+    }
     cudaSetDevice(0);
     cuda_config_ = std::make_shared<kernel::CudaConfig>();
     cudaStreamCreate(&cuda_config_->stream);

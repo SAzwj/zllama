@@ -4,14 +4,19 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Set the CUDA compiler path or name
 set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90")
 
 project(llama_infer CXX CUDA)
+
+set(CMAKE_CXX_FLAGS "-O0 ${CMAKE_CXX_FLAGS}")
+set(CMAKE_CUDA_FLAGS "-O0 ${CMAKE_CUDA_FLAGS}")
 include(cmake/cuda.cmake)
+set(CMAKE_BUILD_TYPE Debug)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 14)
+set(CMAKE_CUDA_STANDARD 17)
 
 option(LLAMA3_SUPPORT OFF)
 if (LLAMA3_SUPPORT)
@@ -114,5 +119,9 @@ if(USE_CPM)
 endif()
 
 set_target_properties(llama PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_options(llama PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-G -g>
+)
+
 add_subdirectory(test)
 add_subdirectory(demo)

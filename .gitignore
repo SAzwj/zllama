@@ -1,0 +1,20 @@
+# Build directories
+build/
+
+# Model files
+models/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Temporary files
+tmp/
