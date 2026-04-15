@@ -1,5 +1,8 @@
 #ifndef KUIPER_INCLUDE_MODEL_LLAMA_CONFIG_H_
 #define KUIPER_INCLUDE_MODEL_LLAMA_CONFIG_H_
+
+#include <cstdint>
+
 namespace model {
 struct ModelConfig {
   int32_t dim = 0;
@@ -27,6 +30,8 @@ struct TransformerConfig {
   int32_t kv_head_num_ = 0;
   int32_t seq_len_ = 0;
   bool is_shared_weight_ = false;
+  int32_t kv_block_size_ = 0;
+  int32_t kv_block_num_ = 0;
 #ifdef QWEN3_SUPPORT
   int32_t immediate_dim_ = 0;
 #endif

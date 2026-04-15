@@ -110,7 +110,7 @@ base::Status Model::read_model_file() {
   return error::Success();
 }
 
-base::Status Model::generate_model_infos(const ModelConfig& config) const {
+base::Status Model::generate_model_infos(const ModelConfig& config) {
   config_->dim_ = config.dim;
   config_->hidden_dim_ = config.hidden_dim;
   config_->layer_num_ = config.layer_num;
@@ -121,6 +121,10 @@ base::Status Model::generate_model_infos(const ModelConfig& config) const {
   config_->kv_dim_ = (config.dim * config.kv_head_num) / config.head_num;
   config_->kv_mul_ = config.head_num / config.kv_head_num;
   config_->head_size_ = config.dim / config.head_num;
+
+  config_->kv_block_size_ = 16;
+  config_->kv_block_num_ = (config.seq_len + config_->kv_block_size_ - 1) / config_->kv_block_size_;
+
 #if defined(QWEN3_SUPPORT)
   config_->immediate_dim_ = config.immediate_dim_;
 #endif
@@ -137,6 +141,10 @@ base::Status Model::generate_model_infos(const ModelConfig& config) const {
   //       "Vocabulary size mismatch between the model file and the token list.");
   // }
   config_->vocab_size_ = std::abs(config.vocab_size);
+
+  auto kv_manager = std::make_shared<KVCacheManager>(config_->kv_block_num_, config_->kv_block_size_, device_type_);
+  seq_ctx_ = std::make_shared<SequenceContext>(kv_manager);
+
   return base::error::Success();
 }
 
@@ -214,8 +222,16 @@ std::string Model::decode(std::vector<int32_t> token_idxs) const {
 
 std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache(int32_t layer_idx,
                                                                 int32_t token_pos) const {
-  int32_t layer_offset = layer_idx * config_->seq_len_ * config_->kv_dim_;
-  int32_t cache_offset = layer_offset + token_pos * config_->kv_dim_;
+  // PageAttention allocate
+  seq_ctx_->allocate_blocks_for_pos(token_pos);
+
+  int32_t block_size = config_->kv_block_size_;
+  int32_t logical_block_idx = token_pos / block_size;
+  int32_t physical_block_idx = seq_ctx_->get_physical_block_idx(logical_block_idx);
+  int32_t block_offset = token_pos % block_size;
+
+  int32_t layer_offset = layer_idx * config_->kv_block_num_ * block_size * config_->kv_dim_;
+  int32_t cache_offset = layer_offset + physical_block_idx * block_size * config_->kv_dim_ + block_offset * config_->kv_dim_;
 
   float* key_cache_ptr =
       const_cast<float*>(get_buffer(ModelBufferType::kKeyCache).ptr<float>(cache_offset));
@@ -228,6 +244,21 @@ std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache(int32_t layer_id
                      val_cache_ptr);
   key.set_device_type(device_type_);
   val.set_device_type(device_type_);
+
+  // Update block table tensor
+  const std::vector<int32_t>& block_table = seq_ctx_->get_block_table();
+  tensor::Tensor block_table_tensor = get_buffer(ModelBufferType::kBlockTable);
+  int32_t* table_ptr = const_cast<int32_t*>(block_table_tensor.ptr<int32_t>());
+  if (table_ptr) {
+      if (device_type_ == base::DeviceType::kDeviceCPU) {
+          for (size_t i = 0; i < block_table.size(); ++i) {
+              table_ptr[i] = block_table[i];
+          }
+      } else if (device_type_ == base::DeviceType::kDeviceCUDA) {
+          cudaMemcpy(table_ptr, block_table.data(), block_table.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+      }
+  }
+
   return {key, val};
 }
 

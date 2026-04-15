@@ -29,6 +29,8 @@ enum class ModelBufferType {
 
   kSinCache = 17,
   kCosCache = 18,
+
+  kBlockTable = 19,
 };
 }
 

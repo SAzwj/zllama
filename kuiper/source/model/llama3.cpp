@@ -177,7 +177,7 @@ void LLama2Model::create_nonparam_layers() {
 
   llama_layers_->mha_layer_ = std::make_shared<op::MultiHeadAttention>(
       device_type_, 0, config_->kv_mul_, config_->kv_dim_, config_->seq_len_, config_->head_num_,
-      config_->head_size_);
+      config_->head_size_, config_->kv_block_size_);
 
   llama_layers_->add_layer_ = std::make_shared<op::VecAddLayer>(device_type_);
 
@@ -469,14 +469,17 @@ void LLama2Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kW1Output, w1_output));
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
 
-  // kv cache
-  tensor::Tensor key_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
-                           config_->kv_dim_, true, alloc);
-  tensor::Tensor value_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
-                             config_->kv_dim_, true, alloc);
+  // kv cache (PageAttention format)
+  tensor::Tensor key_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->kv_block_num_,
+                           config_->kv_block_size_, config_->kv_dim_, true, alloc);
+  tensor::Tensor value_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->kv_block_num_,
+                             config_->kv_block_size_, config_->kv_dim_, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
   CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
+
+  tensor::Tensor block_table_tensor(base::DataType::kDataTypeInt32, config_->kv_block_num_, true, alloc);
+  CHECK(insert_buffer(ModelBufferType::kBlockTable, block_table_tensor));
 
   // Wq query output
   tensor::Tensor query(base::DataType::kDataTypeFp32, config_->dim_, true, alloc);
@@ -664,13 +667,14 @@ void LLama2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_ten
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
   tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
+  tensor::Tensor block_table_tensor = get_buffer(ModelBufferType::kBlockTable);
 
   const auto& mha_layer = llama_layers_->mha_layer_;
   CHECK_NE(mha_layer, nullptr) << "The multi head attention layer is null pointer.";
   int pos = pos_tensor.index<int32_t>(0);
   std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_pos(pos);
   std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_layer_idx(layer_idx);
-  STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, mha_output));
+  STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, block_table_tensor, mha_output));
 
   // wo @ attention output
   tensor::Tensor attn_output = get_buffer(ModelBufferType::kAttnOutput);

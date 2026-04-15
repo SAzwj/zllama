@@ -10,6 +10,7 @@
 #include "sampler/argmax_sampler.h"
 #include "sentencepiece_processor.h"
 #include "tensor/tensor.h"
+#include "sequence_context.h"
 
 namespace model {
 class Model {
@@ -63,7 +64,7 @@ class Model {
 
   virtual base::Status gen_model_from_file();
 
-  virtual base::Status generate_model_infos(const ModelConfig& config) const;
+  virtual base::Status generate_model_infos(const ModelConfig& config);
 
   virtual int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const = 0;
 
@@ -89,6 +90,7 @@ class Model {
   std::map<ModelBufferType, tensor::Tensor> buffers_;
   std::unique_ptr<sampler::Sampler> sampler_;
   std::shared_ptr<RawModelData> raw_model_data_;
+  std::shared_ptr<SequenceContext> seq_ctx_;
   base::DeviceType device_type_ = base::DeviceType::kDeviceUnknown;
   base::ModelType model_type_ = base::ModelType::kModelTypeUnknown;
   base::TokenizerType tokenizer_type_ = base::TokenizerType::kEncodeUnknown;

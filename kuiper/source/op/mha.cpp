@@ -4,15 +4,16 @@
 namespace op {
 MultiHeadAttention::MultiHeadAttention(base::DeviceType device_type, int32_t layer_index,
                                        int32_t kv_mul, int32_t kv_dim, int32_t seq_len,
-                                       int32_t head_num, int32_t head_size)
+                                       int32_t head_num, int32_t head_size, int32_t kv_block_size)
     : Layer(device_type, LayerType::kLayerMHA, "MultiHead"),
       layer_index_(layer_index),
       kv_mul_(kv_mul),
       kv_dim_(kv_dim),
       seq_len_(seq_len),
       head_num_(head_num),
-      head_size_(head_size) {
-  reset_input_size(5);
+      head_size_(head_size),
+      kv_block_size_(kv_block_size) {
+  reset_input_size(5); // [query, score, key_cache, value_cache, block_table]
   reset_output_size(1);
 }
 
@@ -26,13 +27,14 @@ base::Status MultiHeadAttention::forward() {
   const tensor::Tensor& score_tensor = this->get_input(1);
   const tensor::Tensor& key_cache_tensor = this->get_input(2);
   const tensor::Tensor& value_cache_tensor = this->get_input(3);
+  const tensor::Tensor& block_table_tensor = this->get_input(4);
 
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
   kernel::get_mha_kernel(device_type_)(pos_, head_num_, layer_index_, seq_len_, kv_dim_, kv_mul_,
-                                       head_size_, mha_out, query_tensor, score_tensor,
-                                       key_cache_tensor, value_cache_tensor, device_type_,
+                                       head_size_, kv_block_size_, mha_out, query_tensor, score_tensor,
+                                       key_cache_tensor, value_cache_tensor, block_table_tensor, device_type_,
                                        cuda_config_ ? cuda_config_.get() : nullptr);
   return base::error::Success();
 }
@@ -43,10 +45,14 @@ void MultiHeadAttention::set_layer_idx(int32_t layer_idx) { this->layer_index_ =
 
 base::Status MultiHeadAttention::check() const {
   base::Status status;
-  const int32_t input_tensor_num = 4;
+  const int32_t input_tensor_num = 5;
   for (int32_t i = 0; i < input_tensor_num; ++i) {
-    // mha score tensor
-    status = check_tensor(get_input(i), device_type_, data_type_);
+    // mha score tensor (block table is type int32)
+    if (i == 4) {
+      status = check_tensor(get_input(i), device_type_, base::DataType::kDataTypeInt32);
+    } else {
+      status = check_tensor(get_input(i), device_type_, data_type_);
+    }
     if (!status) {
       LOG(ERROR) << "The input tensor " << std::to_string(i) << " error in the matmul layer.";
       return status;

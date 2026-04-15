@@ -3,11 +3,13 @@
 #include "../kernels_interface.h"
 namespace kernel {
 void mha_kernel(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_len, int32_t kv_dim,
-                int32_t kv_mul, int32_t head_size, const tensor::Tensor& mha_out,
+                int32_t kv_mul, int32_t head_size, int32_t kv_block_size, const tensor::Tensor& mha_out,
                 const tensor::Tensor& query_tensor, const tensor::Tensor& score_tensor,
                 const tensor::Tensor& key_cache_tensor, const tensor::Tensor& value_cache_tensor,
-                base::DeviceType device_type, CudaConfig* config) {
-  int32_t layer_offset = layer_index * seq_len * kv_dim;
+                const tensor::Tensor& block_table_tensor, base::DeviceType device_type, CudaConfig* config) {
+  int32_t kv_block_num = (seq_len + kv_block_size - 1) / kv_block_size;
+  const int32_t* block_table = block_table_tensor.ptr<int32_t>();
+  int32_t layer_offset = layer_index * kv_block_num * kv_block_size * kv_dim;
   float scale = 1.f / std::sqrt(static_cast<float>(head_size));
 
   std::shared_ptr<base::DeviceAllocator> allocator;
@@ -26,7 +28,10 @@ void mha_kernel(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_
     query_mat.set_device_type(device_type);
     
     for (int32_t t = 0; t <= pos; t++) {
-      int32_t cache_offset = t * kv_dim + (h / kv_mul) * head_size;
+      int32_t logical_block_idx = t / kv_block_size;
+      int32_t physical_block_idx = block_table[logical_block_idx];
+      int32_t block_offset = t % kv_block_size;
+      int32_t cache_offset = physical_block_idx * kv_block_size * kv_dim + block_offset * kv_dim + (h / kv_mul) * head_size;
       const float* key_head_addr = key_cache_tensor.ptr<float>() + layer_offset + cache_offset;
       tensor::Tensor key_mat(base::DataType::kDataTypeFp32, 1, head_size, false, nullptr,
                              const_cast<float*>(key_head_addr));
@@ -50,13 +55,19 @@ void mha_kernel(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_
                                  output_head_ptr);
     output_tensor.set_device_type(device_type);
 
-    int32_t cache_offset = (h / kv_mul) * head_size;
-    float* value_head_addr =
-        const_cast<float*>(value_cache_tensor.ptr<float>()) + layer_offset + cache_offset;
-    tensor::Tensor value_tensor(base::DataType::kDataTypeFp32, head_size, false, nullptr,
-                                value_head_addr);
-    get_scale_sum_kernel(device_type)(value_tensor, score_head_tensor, output_tensor, pos,
-                                      head_size, kv_dim, config ? config->stream : nullptr);
+    int32_t head_offset = (h / kv_mul) * head_size;
+    for (int i = 0; i < head_size; i++) {
+        float value = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            int32_t logical_block_idx = t / kv_block_size;
+            int32_t physical_block_idx = block_table[logical_block_idx];
+            int32_t block_offset = t % kv_block_size;
+            float* value_head_addr = const_cast<float*>(value_cache_tensor.ptr<float>()) + layer_offset + physical_block_idx * kv_block_size * kv_dim + block_offset * kv_dim + head_offset;
+            float score = score_head_addr[t];
+            value += score * value_head_addr[i];
+        }
+        output_head_ptr[i] = value;
+    }
   }
 }
 }  // namespace kernel

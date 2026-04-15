@@ -56,9 +56,10 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 
 __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float* query,
                                             float* score_ptr, float* output, float* key_cache,
-                                            float* value_cache, int32_t kv_dim, int32_t kv_mul,
+                                            float* value_cache, int32_t* block_table,
+                                            int32_t kv_dim, int32_t kv_mul,
                                             int32_t head_num, int32_t head_size,
-                                            int32_t layer_offset) {
+                                            int32_t layer_offset, int32_t kv_block_size) {
   int head = blockIdx.x;
   if (head >= head_num) {
     return;
@@ -81,7 +82,11 @@ __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float*
   int head_offset = (head / kv_mul) * head_size;
   // 计算自注意力分数
   for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-    float* key_head = key_cache + layer_offset + t * kv_dim + head_offset;
+    int logical_block_idx = t / kv_block_size;
+    int physical_block_idx = block_table[logical_block_idx];
+    int block_offset = t % kv_block_size;
+    
+    float* key_head = key_cache + layer_offset + physical_block_idx * kv_block_size * kv_dim + block_offset * kv_dim + head_offset;
 
     float score = 0.0f;
     for (int i = 0; i < head_size; i += 4) {
@@ -105,7 +110,11 @@ __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float*
   for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
     float value = 0.0f;
     for (int t = 0; t <= pos; t++) {
-      float* value_head = value_cache + layer_offset + t * kv_dim + head_offset;
+      int logical_block_idx = t / kv_block_size;
+      int physical_block_idx = block_table[logical_block_idx];
+      int block_offset = t % kv_block_size;
+
+      float* value_head = value_cache + layer_offset + physical_block_idx * kv_block_size * kv_dim + block_offset * kv_dim + head_offset;
       float score = score_head[t];
       value += score * value_head[i];
     }
@@ -114,23 +123,26 @@ __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float*
 }
 
 void mha_kernel_cu(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_len,
-                   int32_t kv_dim, int32_t kv_mul, int32_t head_size, const tensor::Tensor& mha_out,
-                   const tensor::Tensor& query_tensor, const tensor::Tensor& score_tensor,
-                   const tensor::Tensor& key_cache_tensor, const tensor::Tensor& value_cache_tensor,
+                   int32_t kv_dim, int32_t kv_mul, int32_t head_size, int32_t kv_block_size,
+                   const tensor::Tensor& mha_out, const tensor::Tensor& query_tensor,
+                   const tensor::Tensor& score_tensor, const tensor::Tensor& key_cache_tensor,
+                   const tensor::Tensor& value_cache_tensor, const tensor::Tensor& block_table_tensor,
                    base::DeviceType device_type, CudaConfig* config) {
   UNUSED(device_type);
-  int32_t layer_offset = layer_index * seq_len * kv_dim;
+  int32_t kv_block_num = (seq_len + kv_block_size - 1) / kv_block_size;
+  int32_t layer_offset = layer_index * kv_block_num * kv_block_size * kv_dim;
   float* query = const_cast<float*>(query_tensor.ptr<float>());
   float* score = const_cast<float*>(score_tensor.ptr<float>());
   float* output = const_cast<float*>(mha_out.ptr<float>());
 
   float* key_cache = const_cast<float*>(key_cache_tensor.ptr<float>());
   float* value_cache = const_cast<float*>(value_cache_tensor.ptr<float>());
+  int32_t* block_table = const_cast<int32_t*>(block_table_tensor.ptr<int32_t>());
 
   cudaStream_t stream = config->stream;
   multi_head_attention_kernel<<<head_num, thread_num, head_size * sizeof(float), stream>>>(
-      pos, seq_len, query, score, output, key_cache, value_cache, kv_dim, kv_mul, head_num,
-      head_size, layer_offset);
+      pos, seq_len, query, score, output, key_cache, value_cache, block_table, kv_dim, kv_mul, head_num,
+      head_size, layer_offset, kv_block_size);
 }
 
 }  // namespace kernel
