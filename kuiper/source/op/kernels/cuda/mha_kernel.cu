@@ -54,7 +54,10 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 }
 
 
-__global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float* query,
+#define Bc 16
+#define Br 16
+
+__global__ void flash_attention_v2_kernel(int32_t pos, int32_t seq_len, float* query,
                                             float* score_ptr, float* output, float* key_cache,
                                             float* value_cache, int32_t* block_table,
                                             int32_t kv_dim, int32_t kv_mul,
@@ -65,60 +68,173 @@ __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float*
     return;
   }
 
-  extern __shared__ float s_query_head[];
-  float scale = 1.f / sqrtf(float(head_size));
-  float* query_head = query + head * head_size;
+  // NOTE: For decoding pos = seq_len - 1 is passed to pos. So actually the sequence length is pos + 1.
+  int total_seqlen = pos + 1;
+  float smScale = 1.f / sqrtf(float(head_size));
 
-  // 预加载query到共享内存
-  for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
-    s_query_head[i] = query_head[i];
-  }
-  __syncthreads();
+  // block size for K, V
+  // group of row(seqlen)
+  int groupSeq = (total_seqlen + Bc - 1) / Bc;
+  // parallel process for V[Br, d]
+  // group of column
+  int groupTx = (head_size + Bc - 1) / Bc;
+  int groupTy = (head_size + Br - 1) / Br;
 
-  float* score_head = score_ptr + head * seq_len;
-  // head当前的注意力头索引，kv_mul用于gqa，head_size表示一个自注意力头的维度
-  // kv_dim = head_size * head_num，多头自注意力情况下的key,value 维度
-  // kv_dim = head_size * head_num / kv_num，GQA情况下的key,value 维度
+  // load slice from global memory(HBM)
+  extern __shared__ float shared_mem[];
+  float* sQ = shared_mem;
+  float* sK = shared_mem + Br * head_size;
+  float* sV = shared_mem + 2 * Br * head_size;
+  float* sO = shared_mem + 3 * Br * head_size;
+  float* sQK = shared_mem + 4 * Br * head_size;
+  float* sSafeE = shared_mem + 4 * Br * head_size + Br * Bc;
+  float* sDenom = shared_mem + 4 * Br * head_size + 2 * Br * Bc;
+  float* sMax = shared_mem + 4 * Br * head_size + 2 * Br * Bc + Br;
+
+  // [0, Bc]
+  int tx = threadIdx.x;
+  // [0, Br]
+  int ty = threadIdx.y;
+
+  // blockIdx.y is the query sequence row block.
+  // Since it's decoding/prefilling, we calculate one row for each token.
+  // For prefill pos could be sequence length - 1, and seq_len is pos+1.
+  // But in this implementation, the query size is always 1 token.
+  int row = ty + blockIdx.y * blockDim.y;
+
   int head_offset = (head / kv_mul) * head_size;
-  // 计算自注意力分数
-  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-    int logical_block_idx = t / kv_block_size;
-    int physical_block_idx = block_table[logical_block_idx];
-    int block_offset = t % kv_block_size;
-    
-    float* key_head = key_cache + layer_offset + physical_block_idx * kv_block_size * kv_dim + block_offset * kv_dim + head_offset;
+  float* query_head = query + head * head_size;
+  float* output_head = output + head * head_size;
 
-    float score = 0.0f;
-    for (int i = 0; i < head_size; i += 4) {
-      float4 key_val = *reinterpret_cast<float4*>(key_head + i);
-      float4 query_val = *reinterpret_cast<float4*>(s_query_head + i);
-
-      score += key_val.x * query_val.x + key_val.y * query_val.y + key_val.z * query_val.z +
-               key_val.w * query_val.w;
+  // load q, o, max, denom from global memory to shared memory
+  // Q[Br, dim]
+  for (int i = 0; i < groupTx; i++) {
+    if (i * Bc + tx < head_size) {
+      if (row < 1) {
+        sQ[ty * head_size + i * Bc + tx] = query_head[row * head_size + i * Bc + tx];
+      } else {
+        sQ[ty * head_size + i * Bc + tx] = 0.f;
+      }
+      sO[ty * head_size + i * Bc + tx] = 0;
     }
+  }
 
-    score *= scale;
-    score_head[t] = score;
+  if (tx == 0) {
+    sMax[ty] = -INFINITY;
+    sDenom[ty] = 0;
   }
   __syncthreads();
 
-  softmax_gpu(score_head, pos + 1);
-  __syncthreads();
-
-  float* output_head = output + head * head_size;
-  // 使用自注意力分数对value矩阵加权
-  for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
-    float value = 0.0f;
-    for (int t = 0; t <= pos; t++) {
+  // load K, V block
+  // Q[Br][dim] @ K[0..seqlen.step(Bc), dim]
+  // compute partial sum of O[ty][dim] each iteration
+  for (int j = 0; j < groupSeq; j++) {
+    // wait until previous iteration g2s done
+    __syncthreads();
+    
+    if ((j * Bc + tx) < total_seqlen) {
+      // load k, v from global memory to shared memory
+      // K[seqlen, dim], V[seqlen, dim]
+      int t = j * Bc + tx;
       int logical_block_idx = t / kv_block_size;
       int physical_block_idx = block_table[logical_block_idx];
       int block_offset = t % kv_block_size;
-
+      
+      float* key_head = key_cache + layer_offset + physical_block_idx * kv_block_size * kv_dim + block_offset * kv_dim + head_offset;
       float* value_head = value_cache + layer_offset + physical_block_idx * kv_block_size * kv_dim + block_offset * kv_dim + head_offset;
-      float score = score_head[t];
-      value += score * value_head[i];
+
+      for (int i = 0; i < groupTy; i++) {
+        if (i * Br + ty < head_size) {
+          sK[tx * head_size + i * Br + ty] = key_head[i * Br + ty];
+          sV[tx * head_size + i * Br + ty] = value_head[i * Br + ty];
+        }
+      }
+    } else { // padding for elements outside sequence length
+      for (int i = 0; i < groupTy; i++) {
+        if (i * Br + ty < head_size) {
+          sK[tx * head_size + i * Br + ty] = 0;
+          sV[tx * head_size + i * Br + ty] = 0;
+        }
+      }
     }
-    output_head[i] = value;
+
+    // wait until g2s done
+    __syncthreads();
+
+    // compute qk
+    float sum = 0.f;
+    // result oriented: qk[y][x] from q[y] @ k[x]
+    for (int i = 0; i < head_size; i++) {
+      sum += sQ[ty * head_size + i] * sK[tx * head_size + i];
+    }
+    // sQK[Br, Bc]
+    if (j * Bc + tx < total_seqlen && row < 1) {
+        sQK[ty * Bc + tx] = sum * smScale;
+    } else {
+        sQK[ty * Bc + tx] = -INFINITY; // mask
+    }
+
+    // wait until qk done
+    __syncthreads();
+
+    // compute local max of each row of qk
+    float localMax = -INFINITY;
+    for (int i = 0; i < Bc; i++) {
+      localMax = max(localMax, sQK[ty * Bc + i]);
+    }
+    __syncthreads();
+    // compute the max of each row
+    float newMax = max(sMax[ty], localMax);
+
+    // compute safe e(e^{x - max}) of each qk element
+    sSafeE[ty * Bc + tx] = exp(sQK[ty * Bc + tx] - newMax);
+    __syncthreads();
+
+    // accumulate local denom of each row of qk with local max
+    float localDenom = 0.f;
+    for (int i = 0; i < Bc; i++) {
+      localDenom += sSafeE[ty * Bc + i];
+    }
+    __syncthreads();
+
+    // rescale history result
+    float rescaleOld = exp(sMax[ty] - newMax);
+    // rescale denom
+    float newDenom = sDenom[ty] * rescaleOld + localDenom;
+
+    // NOTE:
+    // QK[Br, Bc] @ V[Bc, d] = O[Br, d]
+    // tx in [0, Bc], ty in [0, Br]
+    // slice-Bc and each O[ty, group.x] as accumulator
+    for (int i = 0; i < groupTx; i++) {
+      if (i * Bc + tx < head_size) {
+        // NOTE: rescale old_o(numerator only for now) once: old_nume * rescale
+        sO[ty * head_size + i * Bc + tx] = (sO[ty * head_size + i * Bc + tx] * rescaleOld);
+        for (int k = 0; k < Bc; k++) {
+          // NOTE:
+          // accumulate numerator
+          // new_nume = old_nume' + local_nume (Softmax(QK)@V)
+          sO[ty * head_size + i * Bc + tx] += sSafeE[ty * Bc + k] * sV[k * head_size + i * Bc + tx];
+        }
+      }
+    }
+
+    // update global max and denom
+    if (tx == 0) {
+      sMax[ty] = newMax;
+      sDenom[ty] = newDenom;
+    }
+    __syncthreads();
+  }
+
+  // rescale O in the end
+  for (int i = 0; i < groupTx; i++) {
+    if (i * Bc + tx < head_size) {
+      if (row < 1) {
+        // copy sO[row, dim] to gO[row, dim]
+        output_head[row * head_size + i * Bc + tx] = sO[ty * head_size + i * Bc + tx] / sDenom[ty];
+      }
+    }
   }
 }
 
@@ -140,7 +256,18 @@ void mha_kernel_cu(int32_t pos, int32_t head_num, int32_t layer_index, int32_t s
   int32_t* block_table = const_cast<int32_t*>(block_table_tensor.ptr<int32_t>());
 
   cudaStream_t stream = config->stream;
-  multi_head_attention_kernel<<<head_num, thread_num, head_size * sizeof(float), stream>>>(
+  
+  dim3 grid(head_num);
+  dim3 block(Bc, Br);
+  
+  // memory size: sQ, sK, sV, sO, sQK, sSafeE, sDenom, sMax
+  // We allocate 256 for head_size in shared memory pointers above just as a max cap.
+  // Actually shared_mem needs to be sized properly.
+  // sQ[Br][head_size], sK[Bc][head_size], sV[Bc][head_size], sO[Br][head_size]
+  // sQK[Br][Bc], sSafeE[Br][Bc], sDenom[Br], sMax[Br]
+  int smem_size = (4 * Br * head_size + 2 * Br * Bc + 2 * Br) * sizeof(float);
+  
+  flash_attention_v2_kernel<<<grid, block, smem_size, stream>>>(
       pos, seq_len, query, score, output, key_cache, value_cache, block_table, kv_dim, kv_mul, head_num,
       head_size, layer_offset, kv_block_size);
 }
